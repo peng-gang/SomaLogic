@@ -1,0 +1,2008 @@
+---
+title: "SomaLogic Proteomics Data Analsysi for Restless Legs Syndrome"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 4
+    theme: united
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+
+library(SomaDataIO)
+library(reshape2)
+library(ggplot2)
+library(ComplexHeatmap)
+library(ggrepel)
+library(ggpubr)
+
+library(randomForest)
+library(glmnet)
+library(org.Hs.eg.db)
+
+library(kableExtra)
+firstRun <- FALSE
+```
+
+## Data Summary
+
+### Proteomics
+Median normalized data "SS-216751_v4.1_CSF.hybNorm.medNormInt.plateScale.calibrate.anmlQC.qcCheck.AddLOD.anmlSMP.adat" was imported using R package "SomaDataIO". We only used protein from organism "Human" with type "Protein". 7288 proteins from 40 samples were left for the following analysis. The box below shows the distribution of abundance for proteins in each sample after median normalization.  
+
+```{r dataLoading}
+if(firstRun){
+  sampleInfo <- readxl::read_xlsx("../data/Norm Somascan analyze.xlsx", sheet = "Samples", range = "A1:B41")
+
+  soma <- read_adat("../data/SS-216751_v4.1_CSF.hybNorm.medNormInt.plateScale.calibrate.anmlQC.qcCheck.AddLOD.anmlSMP.adat")
+  
+  phenotype <- readxl::read_xlsx("../data/Demographic Data.11.15.21_V2.xlsx", range = "A1:H53")
+  
+  id <- paste(phenotype$ID, "CSF", sep = "_")
+  idx <- match(sampleInfo$SampleId, id)
+  if(sum(id[idx] == sampleInfo$SampleId) != nrow(sampleInfo)){
+    stop("No info for some samples!")
+  }
+  
+  phenotype <- phenotype[idx,]
+  phenotype$ID <- paste(phenotype$ID, "CSF", sep = "_")
+  
+  anaInfo <- getAnalyteInfo(soma)
+  
+  idxSample <- match(phenotype$ID, soma$SampleId)
+  if(sum(soma$SampleId[idxSample] == phenotype$ID) != nrow(phenotype)){
+    stop("Sample mismatch!")
+  }
+  
+  # only human and protein
+  flagHPT <- anaInfo$Organism == "Human" & anaInfo$Type == "Protein"
+  
+  somaSel <- soma[idxSample, anaInfo$AptName[flagHPT]]
+  
+  anaInfoSel <- anaInfo[flagHPT,]
+  sampleDetail <- soma[idxSample,1:33]
+  
+  if(sum(rownames(sampleDetail) == rownames(somaSel))!=nrow(somaSel)){
+    stop("Mismatch")
+  }
+  
+  if(sum(sampleDetail$SampleId == phenotype$ID) != nrow(phenotype)){
+    stop("Mismatch")
+  }
+  
+  
+  save(phenotype, anaInfoSel, somaSel, sampleDetail, file = "data/DataCleaned.RData")
+  
+  dplot <- melt(cbind(sampleInfo, somaSel), 
+                id.vars = c("SampleId", "Group"), 
+                variable.name = "Protein", value.name = "abundance")
+  #dplot$SampleId <- factor(dplot$SampleId)
+  gp <- ggplot(dplot) + 
+    geom_boxplot(aes(x=SampleId, y=abundance, fill = Group)) + 
+    scale_y_log10() + 
+    labs(x="", y="Abundance") + 
+    theme_light() + 
+    theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1, size = 5))
+
+  png("figures/boxAbundance.png", width = 7, height = 5, units = "in", res = 300)
+  print(gp)
+  invisible(dev.off())
+  
+  
+  gp <- ggplot(phenotype) + 
+    geom_boxplot(aes(x=Grp, y=Age)) + 
+    labs(x= "") + 
+    theme_light()
+  
+  png("figures/Age.png", width = 4, height = 3, units = "in", res = 300)
+  print(gp)
+  invisible(dev.off())
+  
+  
+  gp <- ggplot(phenotype) + 
+    geom_boxplot(aes(x=Grp, y=BMI)) + 
+    labs(x= "") + 
+    theme_light()
+  
+  png("figures/BMI.png", width = 4, height = 3, units = "in", res = 300)
+  print(gp)
+  invisible(dev.off())
+  
+} else {
+  load("data/DataCleaned.RData")
+}
+
+```
+
+![Boxplot of abundance for proteins in each sample](figures/boxAbundance.png){width=50%}
+
+
+### Phenotype
+
+The table below shows the phenotype information in this study. 
+
+```{r phenotype}
+#fisher.test(table(phenotype$Grp, phenotype$Sex))
+#t.test(Age~Grp, data = phenotype)
+#t.test(BMI~Grp, data = phenotype)
+kable(phenotype, caption = "Phenotype information", row.names = FALSE) %>%
+  kable_styling(full_width = F, position = "left", html_font = "Cambria")
+```
+
+There is no significant difference (Fisher's exact test, p value = 1) of sex  between control group and RLS group. We did not see significant difference of age and BMI between two groups neither (T-test, p value = 0.34 and 0.83 for age and BMI respectively). 
+
+
+![Boxplot of age between two groups](figures/Age.png){width=50%}
+
+
+![Boxplot of BMI between two groups](figures/BMI.png){width=50%}
+
+
+### Clustering analysis
+
+#### PCA
+##### All data
+```{r PCA}
+if(firstRun){
+  pr <- prcomp(scale(log2(somaSel), center = TRUE, scale = TRUE))
+  spr <- summary(pr)
+  
+  dplot <- data.frame(
+    pr$x,
+    group = phenotype$Grp,
+    id = phenotype$ID,
+    sex = phenotype$Sex,
+    age = phenotype$Age,
+    bmi = phenotype$BMI,
+    stringsAsFactors = FALSE
+  )
+  
+  nplot <- 5
+  idx <- 1
+  gps <- list()
+  axisTextSize <- 8
+  for(i in 1:nplot){
+    for(j in 1:nplot){
+      if(i==j){
+        gp <- ggplot(dplot) + 
+          geom_density(aes_string(x = paste0("PC", i))) + 
+          labs(x = paste0("PC", i, "(", format(round(spr$importance[2,i]*100, 2), nsmall = 2), "%)"),
+               y = "Density") +
+          theme_light() + 
+          theme(axis.text = element_text(size = axisTextSize))
+        gps[[idx]] <- gp
+        idx <- idx + 1
+      } else if(i<j){
+        gp <- ggplot(dplot) + 
+          geom_point(aes_string(x=paste0("PC", j), y=paste0("PC",i), color="group"))+
+          labs(x=paste0("PC",j), y=paste0("PC",i)) + 
+          ggsci::scale_color_nejm() + 
+          theme_light() + 
+          theme(legend.title = element_blank(), axis.text = element_text(size = axisTextSize))
+        gps[[idx]] <- gp
+        idx <- idx + 1
+      } else {
+        gps[[idx]] <- NULL
+        idx <- idx + 1
+      }
+    }
+  }
+  
+  gp <- ggpubr::ggarrange(
+    plotlist = gps,
+    nrow = nplot, ncol = nplot,
+    common.legend = TRUE, legend = "bottom"
+  )
+  
+  
+  png("figures/PCAGrp.png", width = 9, height = 8, units = "in", res = 300)
+  print(gp)
+  invisible(dev.off())
+  
+  
+  
+  
+  nplot <- 5
+  idx <- 1
+  gps <- list()
+  axisTextSize <- 8
+  for(i in 1:nplot){
+    for(j in 1:nplot){
+      if(i==j){
+        gp <- ggplot(dplot) + 
+          geom_density(aes_string(x = paste0("PC", i))) + 
+          labs(x = paste0("PC", i, "(", format(round(spr$importance[2,i]*100, 2), nsmall = 2), "%)"),
+               y = "Density") +
+          theme_light() + 
+          theme(axis.text = element_text(size = axisTextSize))
+        gps[[idx]] <- gp
+        idx <- idx + 1
+      } else if(i<j){
+        gp <- ggplot(dplot) + 
+          geom_point(aes_string(x=paste0("PC", j), y=paste0("PC",i), color="sex"))+
+          labs(x=paste0("PC",j), y=paste0("PC",i)) + 
+          ggsci::scale_color_nejm() + 
+          theme_light() + 
+          theme(legend.title = element_blank(), axis.text = element_text(size = axisTextSize))
+        gps[[idx]] <- gp
+        idx <- idx + 1
+      } else {
+        gps[[idx]] <- NULL
+        idx <- idx + 1
+      }
+    }
+  }
+  
+  gp <- ggpubr::ggarrange(
+    plotlist = gps,
+    nrow = nplot, ncol = nplot,
+    common.legend = TRUE, legend = "bottom"
+  )
+  
+  
+  png("figures/PCASex.png", width = 9, height = 8, units = "in", res = 300)
+  print(gp)
+  invisible(dev.off())
+  
+  
+  nplot <- 5
+  idx <- 1
+  gps <- list()
+  axisTextSize <- 8
+  for(i in 1:nplot){
+    for(j in 1:nplot){
+      if(i==j){
+        gp <- ggplot(dplot) + 
+          geom_density(aes_string(x = paste0("PC", i))) + 
+          labs(x = paste0("PC", i, "(", format(round(spr$importance[2,i]*100, 2), nsmall = 2), "%)"),
+               y = "Density") +
+          theme_light() + 
+          theme(axis.text = element_text(size = axisTextSize))
+        gps[[idx]] <- gp
+        idx <- idx + 1
+      } else if(i<j){
+        gp <- ggplot(dplot) + 
+          geom_point(aes_string(x=paste0("PC", j), y=paste0("PC",i), color="age"))+
+          labs(x=paste0("PC",j), y=paste0("PC",i)) + 
+          scale_color_gradient(low="blue", high="red") + 
+          theme_light() + 
+          theme(legend.title = element_blank(), axis.text = element_text(size = axisTextSize))
+        gps[[idx]] <- gp
+        idx <- idx + 1
+      } else {
+        gps[[idx]] <- NULL
+        idx <- idx + 1
+      }
+    }
+  }
+  
+  gp <- ggpubr::ggarrange(
+    plotlist = gps,
+    nrow = nplot, ncol = nplot,
+    common.legend = TRUE, legend = "bottom"
+  )
+  
+  
+  png("figures/PCAAge.png", width = 9, height = 8, units = "in", res = 300)
+  print(gp)
+  invisible(dev.off())
+  
+  
+  
+  nplot <- 5
+  idx <- 1
+  gps <- list()
+  axisTextSize <- 8
+  for(i in 1:nplot){
+    for(j in 1:nplot){
+      if(i==j){
+        gp <- ggplot(dplot) + 
+          geom_density(aes_string(x = paste0("PC", i))) + 
+          labs(x = paste0("PC", i, "(", format(round(spr$importance[2,i]*100, 2), nsmall = 2), "%)"),
+               y = "Density") +
+          theme_light() + 
+          theme(axis.text = element_text(size = axisTextSize))
+        gps[[idx]] <- gp
+        idx <- idx + 1
+      } else if(i<j){
+        gp <- ggplot(dplot) + 
+          geom_point(aes_string(x=paste0("PC", j), y=paste0("PC",i), color="bmi"))+
+          labs(x=paste0("PC",j), y=paste0("PC",i)) + 
+          scale_color_gradient(low="blue", high="red") + 
+          theme_light() + 
+          theme(legend.title = element_blank(), axis.text = element_text(size = axisTextSize))
+        gps[[idx]] <- gp
+        idx <- idx + 1
+      } else {
+        gps[[idx]] <- NULL
+        idx <- idx + 1
+      }
+    }
+  }
+  
+  gp <- ggpubr::ggarrange(
+    plotlist = gps,
+    nrow = nplot, ncol = nplot,
+    common.legend = TRUE, legend = "bottom"
+  )
+  
+  
+  png("figures/PCABMI.png", width = 9, height = 8, units = "in", res = 300)
+  print(gp)
+  invisible(dev.off())
+  
+  tmp <- cor.test(dplot$PC1, dplot$age)
+  gp <- ggplot(dplot) + 
+    geom_point(aes(x=age, y=PC1)) + 
+    labs(x = "Age", y = "PC1", title = paste0("Cor = ", format(round(tmp$estimate, 2), nsmall = 2), " (p value = ", format(round(tmp$p.value, 3), nsmall = 3), ")")) + 
+    theme_light() + 
+    theme(plot.title = element_text(hjust = 0.5))
+  
+  png("figures/PC1Age.png", width = 4, height = 3, units = "in", res = 300)
+  print(gp)
+  invisible(dev.off())
+  
+  
+  tmp <- t.test(PC1 ~ sex, data = dplot)
+  gp <- ggplot(dplot) + 
+    geom_boxplot(aes(x=sex, y=PC1)) + 
+    labs(x = "Sex", y = "PC1", title = paste0("p value = ", format(round(tmp$p.value, 3), nsmall = 3))) + 
+    theme_light() + 
+    theme(plot.title = element_text(hjust = 0.5))
+  
+  png("figures/PC1Sex.png", width = 4, height = 3, units = "in", res = 300)
+  print(gp)
+  invisible(dev.off())
+}
+
+```
+
+We did not find any clear clusters of RLS and controls from the top 5 PCs in PCA as shown below. 
+
+![Scatter plot of top 5 PCs](figures/PCAGrp.png){width=100%}
+
+PC1 is positively correlated with age and male has high level of PC1. 
+
+![Boxplot of BMI between two groups](figures/PC1Age.png){width=50%}
+
+![Boxplot of BMI between two groups](figures/PC1Sex.png){width=50%}
+
+
+##### Male only
+```{r PCAMale}
+if(firstRun){
+  pr <- prcomp(scale(log2(somaSel[phenotype$Sex=="M",]), center = TRUE, scale = TRUE))
+  spr <- summary(pr)
+  
+  dplot <- data.frame(
+    pr$x,
+    group = phenotype$Grp[phenotype$Sex=="M"],
+    id = phenotype$ID[phenotype$Sex=="M"],
+    sex = phenotype$Sex[phenotype$Sex=="M"],
+    age = phenotype$Age[phenotype$Sex=="M"],
+    bmi = phenotype$BMI[phenotype$Sex=="M"],
+    stringsAsFactors = FALSE
+  )
+  
+  nplot <- 5
+  idx <- 1
+  gps <- list()
+  axisTextSize <- 8
+  for(i in 1:nplot){
+    for(j in 1:nplot){
+      if(i==j){
+        gp <- ggplot(dplot) + 
+          geom_density(aes_string(x = paste0("PC", i))) + 
+          labs(x = paste0("PC", i, "(", format(round(spr$importance[2,i]*100, 2), nsmall = 2), "%)"),
+               y = "Density") +
+          theme_light() + 
+          theme(axis.text = element_text(size = axisTextSize))
+        gps[[idx]] <- gp
+        idx <- idx + 1
+      } else if(i<j){
+        gp <- ggplot(dplot) + 
+          geom_point(aes_string(x=paste0("PC", j), y=paste0("PC",i), color="group"))+
+          labs(x=paste0("PC",j), y=paste0("PC",i)) + 
+          ggsci::scale_color_nejm() + 
+          theme_light() + 
+          theme(legend.title = element_blank(), axis.text = element_text(size = axisTextSize))
+        gps[[idx]] <- gp
+        idx <- idx + 1
+      } else {
+        gps[[idx]] <- NULL
+        idx <- idx + 1
+      }
+    }
+  }
+  
+  gp <- ggpubr::ggarrange(
+    plotlist = gps,
+    nrow = nplot, ncol = nplot,
+    common.legend = TRUE, legend = "bottom"
+  )
+  
+  
+  png("figures/PCAGrpMale.png", width = 9, height = 8, units = "in", res = 300)
+  print(gp)
+  invisible(dev.off())
+  
+  
+  nplot <- 5
+  idx <- 1
+  gps <- list()
+  axisTextSize <- 8
+  for(i in 1:nplot){
+    for(j in 1:nplot){
+      if(i==j){
+        gp <- ggplot(dplot) + 
+          geom_density(aes_string(x = paste0("PC", i))) + 
+          labs(x = paste0("PC", i, "(", format(round(spr$importance[2,i]*100, 2), nsmall = 2), "%)"),
+               y = "Density") +
+          theme_light() + 
+          theme(axis.text = element_text(size = axisTextSize))
+        gps[[idx]] <- gp
+        idx <- idx + 1
+      } else if(i<j){
+        gp <- ggplot(dplot) + 
+          geom_point(aes_string(x=paste0("PC", j), y=paste0("PC",i), color="age"))+
+          labs(x=paste0("PC",j), y=paste0("PC",i)) + 
+          scale_color_gradient(low="blue", high="red") + 
+          theme_light() + 
+          theme(legend.title = element_blank(), axis.text = element_text(size = axisTextSize))
+        gps[[idx]] <- gp
+        idx <- idx + 1
+      } else {
+        gps[[idx]] <- NULL
+        idx <- idx + 1
+      }
+    }
+  }
+  
+  gp <- ggpubr::ggarrange(
+    plotlist = gps,
+    nrow = nplot, ncol = nplot,
+    common.legend = TRUE, legend = "bottom"
+  )
+  
+  
+  png("figures/PCAAgeMale.png", width = 9, height = 8, units = "in", res = 300)
+  print(gp)
+  invisible(dev.off())
+  
+  
+  
+  nplot <- 5
+  idx <- 1
+  gps <- list()
+  axisTextSize <- 8
+  for(i in 1:nplot){
+    for(j in 1:nplot){
+      if(i==j){
+        gp <- ggplot(dplot) + 
+          geom_density(aes_string(x = paste0("PC", i))) + 
+          labs(x = paste0("PC", i, "(", format(round(spr$importance[2,i]*100, 2), nsmall = 2), "%)"),
+               y = "Density") +
+          theme_light() + 
+          theme(axis.text = element_text(size = axisTextSize))
+        gps[[idx]] <- gp
+        idx <- idx + 1
+      } else if(i<j){
+        gp <- ggplot(dplot) + 
+          geom_point(aes_string(x=paste0("PC", j), y=paste0("PC",i), color="bmi"))+
+          labs(x=paste0("PC",j), y=paste0("PC",i)) + 
+          scale_color_gradient(low="blue", high="red") + 
+          theme_light() + 
+          theme(legend.title = element_blank(), axis.text = element_text(size = axisTextSize))
+        gps[[idx]] <- gp
+        idx <- idx + 1
+      } else {
+        gps[[idx]] <- NULL
+        idx <- idx + 1
+      }
+    }
+  }
+  
+  gp <- ggpubr::ggarrange(
+    plotlist = gps,
+    nrow = nplot, ncol = nplot,
+    common.legend = TRUE, legend = "bottom"
+  )
+  
+  
+  png("figures/PCABMIMale.png", width = 9, height = 8, units = "in", res = 300)
+  print(gp)
+  invisible(dev.off())
+  
+  tmp <- cor.test(dplot$PC1, dplot$age)
+  gp <- ggplot(dplot) + 
+    geom_point(aes(x=age, y=PC1)) + 
+    labs(x = "Age", y = "PC1", title = paste0("Cor = ", format(round(tmp$estimate, 2), nsmall = 2), " (p value = ", format(round(tmp$p.value, 3), nsmall = 3), ")")) + 
+    theme_light() + 
+    theme(plot.title = element_text(hjust = 0.5))
+  
+  png("figures/PC1AgeMale.png", width = 4, height = 3, units = "in", res = 300)
+  print(gp)
+  invisible(dev.off())
+}
+
+```
+
+
+We did not find any clear clusters of RLS and controls from the top 5 PCs in PCA as shown below. 
+
+![Scatter plot of top 5 PCs in male](figures/PCAGrpMale.png){width=100%}
+
+We did not find the association between PC1 and age in male. The age of male is older than female in this dataset. That is why we foudn the correlation between age and PC1 in all data. 
+
+![Boxplot of BMI between two groups](figures/PC1AgeMale.png){width=50%}
+
+
+##### Female only
+```{r PCAMale}
+if(firstRun){
+  pr <- prcomp(scale(log2(somaSel[phenotype$Sex=="F",]), center = TRUE, scale = TRUE))
+  spr <- summary(pr)
+  
+  dplot <- data.frame(
+    pr$x,
+    group = phenotype$Grp[phenotype$Sex=="F"],
+    id = phenotype$ID[phenotype$Sex=="F"],
+    sex = phenotype$Sex[phenotype$Sex=="F"],
+    age = phenotype$Age[phenotype$Sex=="F"],
+    bmi = phenotype$BMI[phenotype$Sex=="F"],
+    stringsAsFactors = FALSE
+  )
+  
+  nplot <- 5
+  idx <- 1
+  gps <- list()
+  axisTextSize <- 8
+  for(i in 1:nplot){
+    for(j in 1:nplot){
+      if(i==j){
+        gp <- ggplot(dplot) + 
+          geom_density(aes_string(x = paste0("PC", i))) + 
+          labs(x = paste0("PC", i, "(", format(round(spr$importance[2,i]*100, 2), nsmall = 2), "%)"),
+               y = "Density") +
+          theme_light() + 
+          theme(axis.text = element_text(size = axisTextSize))
+        gps[[idx]] <- gp
+        idx <- idx + 1
+      } else if(i<j){
+        gp <- ggplot(dplot) + 
+          geom_point(aes_string(x=paste0("PC", j), y=paste0("PC",i), color="group"))+
+          labs(x=paste0("PC",j), y=paste0("PC",i)) + 
+          ggsci::scale_color_nejm() + 
+          theme_light() + 
+          theme(legend.title = element_blank(), axis.text = element_text(size = axisTextSize))
+        gps[[idx]] <- gp
+        idx <- idx + 1
+      } else {
+        gps[[idx]] <- NULL
+        idx <- idx + 1
+      }
+    }
+  }
+  
+  gp <- ggpubr::ggarrange(
+    plotlist = gps,
+    nrow = nplot, ncol = nplot,
+    common.legend = TRUE, legend = "bottom"
+  )
+  
+  
+  png("figures/PCAGrpFemale.png", width = 9, height = 8, units = "in", res = 300)
+  print(gp)
+  invisible(dev.off())
+  
+  
+  nplot <- 5
+  idx <- 1
+  gps <- list()
+  axisTextSize <- 8
+  for(i in 1:nplot){
+    for(j in 1:nplot){
+      if(i==j){
+        gp <- ggplot(dplot) + 
+          geom_density(aes_string(x = paste0("PC", i))) + 
+          labs(x = paste0("PC", i, "(", format(round(spr$importance[2,i]*100, 2), nsmall = 2), "%)"),
+               y = "Density") +
+          theme_light() + 
+          theme(axis.text = element_text(size = axisTextSize))
+        gps[[idx]] <- gp
+        idx <- idx + 1
+      } else if(i<j){
+        gp <- ggplot(dplot) + 
+          geom_point(aes_string(x=paste0("PC", j), y=paste0("PC",i), color="age"))+
+          labs(x=paste0("PC",j), y=paste0("PC",i)) + 
+          scale_color_gradient(low="blue", high="red") + 
+          theme_light() + 
+          theme(legend.title = element_blank(), axis.text = element_text(size = axisTextSize))
+        gps[[idx]] <- gp
+        idx <- idx + 1
+      } else {
+        gps[[idx]] <- NULL
+        idx <- idx + 1
+      }
+    }
+  }
+  
+  gp <- ggpubr::ggarrange(
+    plotlist = gps,
+    nrow = nplot, ncol = nplot,
+    common.legend = TRUE, legend = "bottom"
+  )
+  
+  
+  png("figures/PCAAgeFemale.png", width = 9, height = 8, units = "in", res = 300)
+  print(gp)
+  invisible(dev.off())
+  
+  
+  
+  nplot <- 5
+  idx <- 1
+  gps <- list()
+  axisTextSize <- 8
+  for(i in 1:nplot){
+    for(j in 1:nplot){
+      if(i==j){
+        gp <- ggplot(dplot) + 
+          geom_density(aes_string(x = paste0("PC", i))) + 
+          labs(x = paste0("PC", i, "(", format(round(spr$importance[2,i]*100, 2), nsmall = 2), "%)"),
+               y = "Density") +
+          theme_light() + 
+          theme(axis.text = element_text(size = axisTextSize))
+        gps[[idx]] <- gp
+        idx <- idx + 1
+      } else if(i<j){
+        gp <- ggplot(dplot) + 
+          geom_point(aes_string(x=paste0("PC", j), y=paste0("PC",i), color="bmi"))+
+          labs(x=paste0("PC",j), y=paste0("PC",i)) + 
+          scale_color_gradient(low="blue", high="red") + 
+          theme_light() + 
+          theme(legend.title = element_blank(), axis.text = element_text(size = axisTextSize))
+        gps[[idx]] <- gp
+        idx <- idx + 1
+      } else {
+        gps[[idx]] <- NULL
+        idx <- idx + 1
+      }
+    }
+  }
+  
+  gp <- ggpubr::ggarrange(
+    plotlist = gps,
+    nrow = nplot, ncol = nplot,
+    common.legend = TRUE, legend = "bottom"
+  )
+  
+  
+  png("figures/PCABMIFemale.png", width = 9, height = 8, units = "in", res = 300)
+  print(gp)
+  invisible(dev.off())
+  
+  tmp <- cor.test(dplot$PC1, dplot$age)
+  gp <- ggplot(dplot) + 
+    geom_point(aes(x=age, y=PC1)) + 
+    labs(x = "Age", y = "PC1", title = paste0("Cor = ", format(round(tmp$estimate, 2), nsmall = 2), " (p value = ", format(round(tmp$p.value, 3), nsmall = 3), ")")) + 
+    theme_light() + 
+    theme(plot.title = element_text(hjust = 0.5))
+  
+  png("figures/PC1AgeFemale.png", width = 4, height = 3, units = "in", res = 300)
+  print(gp)
+  invisible(dev.off())
+}
+
+```
+
+
+We did not find any clear clusters of RLS and controls from the top 5 PCs in PCA as shown below. 
+
+![Scatter plot of top 5 PCs in male](figures/PCAGrpFemale.png){width=100%}
+
+We FIND the association between PC1 and age in male.  
+
+![Boxplot of BMI between two groups](figures/PC1AgeFemale.png){width=50%}
+
+
+#### Hierachical clustering
+
+```{r heatmap}
+if(firstRun){
+  col_fun = circlize::colorRamp2(c(-2, 0, 2), c("blue", "white", "red"))
+
+  ha = columnAnnotation(
+    Group = factor(phenotype$Grp),
+    Sex = factor(phenotype$Sex),
+    Age = phenotype$Age,
+    BMI = phenotype$BMI,
+    col = list(
+      Group = c("Control" = "darkgreen", "RLS" = "darkred"),
+      Sex = c("F" = "#F39B7FFF", "M" = "#00A087FF"),
+      Age = circlize::colorRamp2(c(27, 78), c("#FEDC91FF", "#E18727FF")),
+      BMI = circlize::colorRamp2(c(16, 34), c("#FE4C97FF", "#BC3C29FF"))
+    ),
+    show_annotation_name = TRUE
+  )
+  hm <- Heatmap(
+    t(scale(log2(somaSel), center = TRUE, scale = TRUE)), 
+    col = col_fun,
+    use_raster = TRUE, 
+    show_row_names = FALSE, 
+    show_row_dend = FALSE,
+    heatmap_legend_param = list(
+      title = "Scaled Abundance",
+      direction = "horizontal"
+    ),
+    top_annotation = ha
+  )
+  
+  png("figures/heatmap.png", width = 10, height = 15, units = "in", res = 300)
+  hm <- draw(hm, heatmap_legend_side = "bottom",
+             annotation_legend_side = "bottom")
+  invisible(dev.off())
+}
+```
+
+
+We can also see some clustering of sex and age but not RLS and control in the heatmap. 
+
+![Boxplot of BMI between two groups](figures/heatmap.png){width=60%}
+
+
+## Comparing RLS and Control
+We compared the protein difference between RLS patients and controls. First, we used t-test to compare protein abundance difference between the two groups without controlling any covariates. Then we took gene set enrichment analysis (GSEA) based on the significant proteins from the t-test. We also compare the protein abundance difference between the two groups after adjusting sex, age, and BMI. Similar GSEA was adopted based on the significant proteins. 
+
+### Without controlling covariates
+
+#### Protein level analysis
+##### All data
+
+```{r proteinLevelAnalysis}
+if(firstRun){
+  idxRLS <- which(phenotype$Grp == "RLS")
+  idxControl <- which(phenotype$Grp == "Control")
+  
+  ratio <- NULL
+  pvalue <- NULL
+  for(i in 1:ncol(somaSel)){
+    d1 <- somaSel[idxRLS,i]
+    d2 <- somaSel[idxControl,i]
+    tmp <- t.test(log2(d1), log2(d2))
+    pvalue <- c(pvalue, tmp$p.value)
+    ratio <- c(ratio, mean(d1)/mean(d2))
+  }
+  
+  rlt <- data.frame(
+    AptName = anaInfoSel$AptName,
+    UniProt = anaInfoSel$UniProt,
+    EntrezGeneID = anaInfoSel$EntrezGeneID,
+    EntrezGeneSymbol = anaInfoSel$EntrezGeneSymbol,
+    pvalue = pvalue,
+    ratio = ratio,
+    log2Ratio = log2(ratio),
+    fdr = p.adjust(pvalue, method = "fdr"),
+    stringsAsFactors = FALSE
+  )
+  
+  write.csv(rlt, file = "tables/pvProtein.csv", quote = TRUE, row.names = FALSE)
+  saveRDS(rlt, file = "data/pvProtein.rds")
+  
+  dplot <- data.frame(
+    UniProt = rlt$UniProt,
+    Symbol = rlt$EntrezGeneSymbol,
+    ratio = rlt$log2Ratio,
+    pvalue = -log10(rlt$pvalue),
+    stringsAsFactors = FALSE
+  )
+  
+  pvCutoff <- -log10(0.05)
+  ratioCutoff <- log2(1.5)
+  
+  dplot$group <- "G0"
+  dplot$group[dplot$pvalue> pvCutoff & dplot$ratio < -ratioCutoff] <- "G1"
+  dplot$group[dplot$pvalue> pvCutoff & dplot$ratio > ratioCutoff] <- "G2"
+  
+  dplotText <- dplot[dplot$group!="G0",]
+  
+  gp <- ggplot(dplot) +
+    geom_point(aes(x=ratio, y = pvalue, color = group), size = 1) + 
+    geom_text_repel(data = dplotText, aes(x=ratio, y=pvalue, label = Symbol, color = group), size = 3)+
+    geom_vline(xintercept = c(-ratioCutoff,ratioCutoff), color = "grey", linetype = 2) + 
+    geom_hline(yintercept = c(pvCutoff), color = "grey", linetype = 2) + 
+    scale_color_manual(values = c(G0="grey", G1="#0072B5FF", G2="#BC3C29FF")) + 
+    labs(x = "log2 Ratio", y="-log10 (p value)") + 
+    theme_classic() + 
+    theme(legend.position = "none")
+  
+  png("figures/volcano.png", width = 5, height = 4, units = "in", res = 300)
+  print(gp)
+  invisible(dev.off())
+} else {
+  rlt <- readRDS("data/pvProtein.rds")
+}
+
+
+```
+
+
+There are only 3 proteins with p value less than 0.05 and ratio larger than 1.5 or smaller than 0.667 as shown in the volcano plot below. 
+
+
+![Volcano plot](figures/volcano.png){width=50%}
+
+
+Top 10 proteins with smallest p value are listed in the table and figure below. There are two IL18R1 because there might be more than 1 SOMAmer reagents targeted one protein. 
+
+```{r top10protein}
+idx <- order(rlt$pvalue)[1:10]
+
+if(firstRun){
+  gps <- list()
+  for(i in 1:length(idx)){
+    gp <- ggplot(data.frame(y=somaSel[, idx[i]], group = phenotype$Grp)) + 
+      geom_boxplot(aes(x=group, y=y)) + 
+      labs(x="", y=anaInfoSel$EntrezGeneSymbol[idx[i]]) + 
+      theme_classic()
+    gps[[i]] <- gp
+  }
+  
+  gp <- ggpubr::ggarrange(plotlist = gps, ncol=2, nrow = 5)
+  
+  png("figures/top10Protein.png", width = 10, height = 20, units = "in", res = 300)
+  print(gp)
+  invisible(dev.off())
+}
+
+
+kable(rlt[idx,], caption = "Top 10 proteins with smallest p value", row.names = FALSE) %>%
+  kable_styling(full_width = F, position = "left", html_font = "Cambria")
+```
+
+
+![Box plot of top 10 proteins](figures/top10Protein.png){width=50%}
+
+
+##### Male Only
+
+```{r proteinLevelAnalysisMale}
+if(firstRun){
+  idxRLS <- which(phenotype$Grp == "RLS" & phenotype$Sex == "M")
+  idxControl <- which(phenotype$Grp == "Control" & phenotype$Sex == "M")
+  
+  ratio <- NULL
+  pvalue <- NULL
+  for(i in 1:ncol(somaSel)){
+    d1 <- somaSel[idxRLS,i]
+    d2 <- somaSel[idxControl,i]
+    tmp <- t.test(log2(d1), log2(d2))
+    pvalue <- c(pvalue, tmp$p.value)
+    ratio <- c(ratio, mean(d1)/mean(d2))
+  }
+  
+  rlt <- data.frame(
+    AptName = anaInfoSel$AptName,
+    UniProt = anaInfoSel$UniProt,
+    EntrezGeneID = anaInfoSel$EntrezGeneID,
+    EntrezGeneSymbol = anaInfoSel$EntrezGeneSymbol,
+    pvalue = pvalue,
+    ratio = ratio,
+    log2Ratio = log2(ratio),
+    fdr = p.adjust(pvalue, method = "fdr"),
+    stringsAsFactors = FALSE
+  )
+  
+  write.csv(rlt, file = "tables/pvProteinMale.csv", quote = TRUE, row.names = FALSE)
+  saveRDS(rlt, file = "data/pvProteinMale.rds")
+  
+  dplot <- data.frame(
+    UniProt = rlt$UniProt,
+    Symbol = rlt$EntrezGeneSymbol,
+    ratio = rlt$log2Ratio,
+    pvalue = -log10(rlt$pvalue),
+    stringsAsFactors = FALSE
+  )
+  
+  pvCutoff <- -log10(0.05)
+  ratioCutoff <- log2(1.5)
+  
+  dplot$group <- "G0"
+  dplot$group[dplot$pvalue> pvCutoff & dplot$ratio < -ratioCutoff] <- "G1"
+  dplot$group[dplot$pvalue> pvCutoff & dplot$ratio > ratioCutoff] <- "G2"
+  
+  dplotText <- dplot[dplot$group!="G0",]
+  
+  gp <- ggplot(dplot) +
+    geom_point(aes(x=ratio, y = pvalue, color = group), size = 1) + 
+    geom_text_repel(data = dplotText, aes(x=ratio, y=pvalue, label = Symbol, color = group), size = 2, max.overlaps = 20)+
+    geom_vline(xintercept = c(-ratioCutoff,ratioCutoff), color = "grey", linetype = 2) + 
+    geom_hline(yintercept = c(pvCutoff), color = "grey", linetype = 2) + 
+    scale_color_manual(values = c(G0="grey", G1="#0072B5FF", G2="#BC3C29FF")) + 
+    labs(x = "log2 Ratio", y="-log10 (p value)") + 
+    theme_classic() + 
+    theme(legend.position = "none")
+  
+  png("figures/volcanoMale.png", width = 5, height = 4, units = "in", res = 300)
+  print(gp)
+  invisible(dev.off())
+} else {
+  rlt <- readRDS("data/pvProteinMale.rds")
+}
+
+
+```
+
+
+There are  more proteins with p value less than 0.05 and ratio larger than 1.5 or smaller than 0.667 as shown in the volcano plot below. 
+
+
+![Volcano plot](figures/volcanoMale.png){width=50%}
+
+
+Top 10 proteins with smallest p value are listed in the table and figure below. 
+
+```{r top10proteinMale}
+idx <- order(rlt$pvalue)[1:10]
+
+if(firstRun){
+  gps <- list()
+  for(i in 1:length(idx)){
+    gp <- ggplot(data.frame(y=somaSel[phenotype$Sex=="M", idx[i]], group = phenotype$Grp[phenotype$Sex=="M"])) + 
+      geom_boxplot(aes(x=group, y=y)) + 
+      labs(x="", y=anaInfoSel$EntrezGeneSymbol[idx[i]]) + 
+      theme_classic()
+    gps[[i]] <- gp
+  }
+  
+  gp <- ggpubr::ggarrange(plotlist = gps, ncol=2, nrow = 5)
+  
+  png("figures/top10ProteinMale.png", width = 10, height = 20, units = "in", res = 300)
+  print(gp)
+  invisible(dev.off())
+}
+
+
+kable(rlt[idx,], caption = "Top 10 proteins with smallest p value", row.names = FALSE) %>%
+  kable_styling(full_width = F, position = "left", html_font = "Cambria")
+```
+
+
+![Box plot of top 10 proteins](figures/top10ProteinMale.png){width=50%}
+
+
+##### Female Only
+
+```{r proteinLevelAnalysisFemale}
+if(firstRun){
+  idxRLS <- which(phenotype$Grp == "RLS" & phenotype$Sex == "F")
+  idxControl <- which(phenotype$Grp == "Control" & phenotype$Sex == "F")
+  
+  ratio <- NULL
+  pvalue <- NULL
+  for(i in 1:ncol(somaSel)){
+    d1 <- somaSel[idxRLS,i]
+    d2 <- somaSel[idxControl,i]
+    tmp <- t.test(log2(d1), log2(d2))
+    pvalue <- c(pvalue, tmp$p.value)
+    ratio <- c(ratio, mean(d1)/mean(d2))
+  }
+  
+  rlt <- data.frame(
+    AptName = anaInfoSel$AptName,
+    UniProt = anaInfoSel$UniProt,
+    EntrezGeneID = anaInfoSel$EntrezGeneID,
+    EntrezGeneSymbol = anaInfoSel$EntrezGeneSymbol,
+    pvalue = pvalue,
+    ratio = ratio,
+    log2Ratio = log2(ratio),
+    fdr = p.adjust(pvalue, method = "fdr"),
+    stringsAsFactors = FALSE
+  )
+  
+  write.csv(rlt, file = "tables/pvProteinFemale.csv", quote = TRUE, row.names = FALSE)
+  saveRDS(rlt, file = "data/pvProteinFemale.rds")
+  
+  dplot <- data.frame(
+    UniProt = rlt$UniProt,
+    Symbol = rlt$EntrezGeneSymbol,
+    ratio = rlt$log2Ratio,
+    pvalue = -log10(rlt$pvalue),
+    stringsAsFactors = FALSE
+  )
+  
+  pvCutoff <- -log10(0.05)
+  ratioCutoff <- log2(1.5)
+  
+  dplot$group <- "G0"
+  dplot$group[dplot$pvalue> pvCutoff & dplot$ratio < -ratioCutoff] <- "G1"
+  dplot$group[dplot$pvalue> pvCutoff & dplot$ratio > ratioCutoff] <- "G2"
+  
+  dplotText <- dplot[dplot$group!="G0",]
+  
+  gp <- ggplot(dplot) +
+    geom_point(aes(x=ratio, y = pvalue, color = group), size = 1) + 
+    geom_text_repel(data = dplotText, aes(x=ratio, y=pvalue, label = Symbol, color = group), size = 2, max.overlaps = 20)+
+    geom_vline(xintercept = c(-ratioCutoff,ratioCutoff), color = "grey", linetype = 2) + 
+    geom_hline(yintercept = c(pvCutoff), color = "grey", linetype = 2) + 
+    scale_color_manual(values = c(G0="grey", G1="#0072B5FF", G2="#BC3C29FF")) + 
+    labs(x = "log2 Ratio", y="-log10 (p value)") + 
+    theme_classic() + 
+    theme(legend.position = "none")
+  
+  png("figures/volcanoFemale.png", width = 5, height = 4, units = "in", res = 300)
+  print(gp)
+  invisible(dev.off())
+} else {
+  rlt <- readRDS("data/pvProteinFemale.rds")
+}
+
+
+```
+
+
+There are  more proteins with p value less than 0.05 and ratio larger than 1.5 or smaller than 0.667 as shown in the volcano plot below. 
+
+
+![Volcano plot](figures/volcanoFemale.png){width=50%}
+
+
+Top 10 proteins with smallest p value are listed in the table and figure below. 
+
+```{r top10proteinFemale}
+idx <- order(rlt$pvalue)[1:10]
+
+if(firstRun){
+  gps <- list()
+  for(i in 1:length(idx)){
+    gp <- ggplot(data.frame(y=somaSel[phenotype$Sex=="M", idx[i]], group = phenotype$Grp[phenotype$Sex=="M"])) + 
+      geom_boxplot(aes(x=group, y=y)) + 
+      labs(x="", y=anaInfoSel$EntrezGeneSymbol[idx[i]]) + 
+      theme_classic()
+    gps[[i]] <- gp
+  }
+  
+  gp <- ggpubr::ggarrange(plotlist = gps, ncol=2, nrow = 5)
+  
+  png("figures/top10ProteinFemale.png", width = 10, height = 20, units = "in", res = 300)
+  print(gp)
+  invisible(dev.off())
+}
+
+
+kable(rlt[idx,], caption = "Top 10 proteins with smallest p value", row.names = FALSE) %>%
+  kable_styling(full_width = F, position = "left", html_font = "Cambria")
+```
+
+
+![Box plot of top 10 proteins](figures/top10ProteinFemale.png){width=50%}
+
+
+##### Compare
+Two shared proteins ("CEMIP2" and "CSMD1") between male and female have different directions. 
+```{r geneLevelCompare}
+if(firstRun){
+  rlt <- readRDS("data/pvProtein.rds")
+  rltMale <- readRDS("data/pvProteinMale.rds")
+  rltFemale <- readRDS("data/pvProteinFemale.rds")
+  
+  x <- list(
+    All = rlt$EntrezGeneSymbol[rlt$pvalue<0.05 & abs(rlt$log2Ratio) > log2(1.5)],
+    Male = rltMale$EntrezGeneSymbol[rltMale$pvalue<0.05 & abs(rltMale$log2Ratio) > log2(1.5)],
+    Female = rltFemale$EntrezGeneSymbol[rltFemale$pvalue<0.05 & abs(rltFemale$log2Ratio) > log2(1.5)]
+  )
+  
+  png("figures/vennGene.png", width = 5, height = 4, units = 'in', res = 300)
+  ggvenn::ggvenn(
+    x, 
+    fill_color = c("#0073C2FF", "#EFC000FF", "#868686FF"),
+    stroke_size = 0.5, set_name_size = 4
+  )
+  invisible(dev.off())
+  
+}
+
+```
+
+![Shared significant proteins](figures/vennGene.png){width=50%}
+
+
+
+#### Gene set enrichment analysis
+
+We took gene set enrichment analysis on KEGG pathways and gene sets base on gene ontology (GO).
+
+##### All
+Top 10 KEGG pathways and top 10 GO gene sets are shown below.
+
+```{r pathway}
+if(firstRun){
+  rlt <- readRDS("data/pvProtein.rds")
+  geneList <- rlt$ratio
+  names(geneList) <- rlt$UniProt
+  geneList <- sort(geneList, decreasing = TRUE)
+  
+  gKEGG <- clusterProfiler::gseKEGG(
+    geneList     = geneList,
+    organism     = 'hsa', 
+    keyType = "uniprot",
+    minGSSize    = 10,
+    pvalueCutoff = 0.05,
+    verbose      = FALSE)
+  
+  
+  gGO <- clusterProfiler::gseGO(
+    geneList     = geneList,
+    ont = "ALL",
+    OrgDb = org.Hs.eg.db,
+    keyType = "UNIPROT",
+    minGSSize    = 100,
+    maxGSSize = 500,
+    eps = 0,
+    pvalueCutoff = 0.05,
+    verbose      = FALSE)
+  
+  
+  png("figures/dotPlotKEGG.png", width = 7, height = 7, units = "in", res = 300)
+  #enrichplot::dotplot(gKEGG, x="Count", showCategory = gKEGG@result$Description[idx[1:10]])
+  enrichplot::dotplot(gKEGG)
+  invisible(dev.off())
+  
+  png("figures/upsetKEGG.png", width = 10, height = 7, units = "in", res = 300)
+  enrichplot::upsetplot(gKEGG)
+  invisible(dev.off())
+  
+  
+  png("figures/dotPlotGO.png", width = 7, height = 7, units = "in", res = 300)
+  #enrichplot::dotplot(gKEGG, x="Count", showCategory = gKEGG@result$Description[idx[1:10]])
+  enrichplot::dotplot(gGO)
+  invisible(dev.off())
+  
+  png("figures/upsetGO.png", width = 10, height = 7, units = "in", res = 300)
+  enrichplot::upsetplot(gGO)
+  invisible(dev.off())
+}
+
+```
+
+
+###### KEGG
+![Dotplot of top 10 KEGG pathways](figures/dotPlotKEGG.png){width=50%}
+
+![Upset plot of top 10 KEGG pathways](figures/upsetKEGG.png){width=50%}
+
+###### Gene Ontology
+
+![Dotplot of top 10 GO gene sets](figures/dotPlotGO.png){width=50%}
+
+
+![Upset plot of top 10 GO gene sets](figures/upsetGO.png){width=50%}
+
+
+
+##### Male
+Top 10 KEGG pathways and top 10 GO gene sets are shown below.
+
+```{r pathwayMale}
+if(firstRun){
+  rlt <- readRDS("data/pvProteinMale.rds")
+  geneList <- rlt$ratio
+  names(geneList) <- rlt$UniProt
+  geneList <- sort(geneList, decreasing = TRUE)
+  
+  gKEGG <- clusterProfiler::gseKEGG(
+    geneList     = geneList,
+    organism     = 'hsa', 
+    keyType = "uniprot",
+    minGSSize    = 10,
+    pvalueCutoff = 0.05,
+    verbose      = FALSE)
+  
+  
+  gGO <- clusterProfiler::gseGO(
+    geneList     = geneList,
+    ont = "ALL",
+    OrgDb = org.Hs.eg.db,
+    keyType = "UNIPROT",
+    minGSSize    = 100,
+    maxGSSize = 500,
+    eps = 0,
+    pvalueCutoff = 0.05,
+    verbose      = FALSE)
+  
+  
+  png("figures/dotPlotKEGGMale.png", width = 7, height = 7, units = "in", res = 300)
+  #enrichplot::dotplot(gKEGG, x="Count", showCategory = gKEGG@result$Description[idx[1:10]])
+  enrichplot::dotplot(gKEGG)
+  invisible(dev.off())
+  
+  png("figures/upsetKEGGMale.png", width = 10, height = 7, units = "in", res = 300)
+  enrichplot::upsetplot(gKEGG)
+  invisible(dev.off())
+  
+  
+  png("figures/dotPlotGOMale.png", width = 7, height = 7, units = "in", res = 300)
+  #enrichplot::dotplot(gKEGG, x="Count", showCategory = gKEGG@result$Description[idx[1:10]])
+  enrichplot::dotplot(gGO)
+  invisible(dev.off())
+  
+  png("figures/upsetGOMale.png", width = 10, height = 7, units = "in", res = 300)
+  enrichplot::upsetplot(gGO)
+  invisible(dev.off())
+}
+
+```
+
+
+###### KEGG
+No significant KEGG pathways.
+
+
+###### Gene Ontology
+
+![Dotplot of top 10 GO gene sets](figures/dotPlotGOMale.png){width=50%}
+
+
+![Upset plot of top 10 GO gene sets](figures/upsetGOMale.png){width=50%}
+
+
+##### Female
+Top 10 KEGG pathways and top 10 GO gene sets are shown below.
+
+```{r pathwayFemale}
+if(firstRun){
+  rlt <- readRDS("data/pvProteinFemale.rds")
+  geneList <- rlt$ratio
+  names(geneList) <- rlt$UniProt
+  geneList <- sort(geneList, decreasing = TRUE)
+  
+  gKEGG <- clusterProfiler::gseKEGG(
+    geneList     = geneList,
+    organism     = 'hsa', 
+    keyType = "uniprot",
+    minGSSize    = 10,
+    pvalueCutoff = 0.05,
+    verbose      = FALSE)
+  
+  
+  gGO <- clusterProfiler::gseGO(
+    geneList     = geneList,
+    ont = "ALL",
+    OrgDb = org.Hs.eg.db,
+    keyType = "UNIPROT",
+    minGSSize    = 100,
+    maxGSSize = 500,
+    eps = 0,
+    pvalueCutoff = 0.05,
+    verbose      = FALSE)
+  
+  
+  png("figures/dotPlotKEGGFemale.png", width = 7, height = 7, units = "in", res = 300)
+  #enrichplot::dotplot(gKEGG, x="Count", showCategory = gKEGG@result$Description[idx[1:10]])
+  enrichplot::dotplot(gKEGG)
+  invisible(dev.off())
+  
+  png("figures/upsetKEGGFemale.png", width = 10, height = 7, units = "in", res = 300)
+  enrichplot::upsetplot(gKEGG)
+  invisible(dev.off())
+  
+  
+  png("figures/dotPlotGOFemale.png", width = 7, height = 7, units = "in", res = 300)
+  #enrichplot::dotplot(gKEGG, x="Count", showCategory = gKEGG@result$Description[idx[1:10]])
+  enrichplot::dotplot(gGO)
+  invisible(dev.off())
+  
+  png("figures/upsetGOFemale.png", width = 10, height = 7, units = "in", res = 300)
+  enrichplot::upsetplot(gGO)
+  invisible(dev.off())
+}
+
+```
+
+
+###### KEGG
+No significant KEGG pathways
+![Dotplot of top 10 KEGG pathways](figures/dotPlotKEGGFemale.png){width=50%}
+
+![Upset plot of top 10 KEGG pathways](figures/upsetKEGGFemale.png){width=50%}
+
+###### Gene Ontology
+
+![Dotplot of top 10 GO gene sets](figures/dotPlotGOFemale.png){width=50%}
+
+
+![Upset plot of top 10 GO gene sets](figures/upsetGOFemale.png){width=50%}
+
+
+
+
+### Controlling covariates
+
+#### Protein level analysis
+
+##### All
+
+We used a regression model listed below to investigate the difference between RLS patients and controls after adjusting sex, age, and BMI. 
+
+$log(Protein) = \beta_0 + \beta_1*sex + \beta_2*age + \beta_3 * BMI + \beta_4*RLS$
+
+
+
+```{r proteinLevelAnalysisAdj}
+if(firstRun){
+  sex <- ifelse(phenotype$Sex=="F", 0, 1)
+  age <- phenotype$Age
+  bmi <- phenotype$BMI
+  rls <- ifelse(phenotype$Grp == "Control", 0, 1)
+  
+  pvalue <- NULL
+  beta <- NULL
+  for(i in 1:ncol(somaSel)){
+    y <- log2(somaSel[,i])
+    
+    tmp <- lm(y ~ sex + age + bmi + rls)
+    tmp <- summary(tmp)
+    
+    pvalue <- c(pvalue, tmp$coefficients[5,4])
+    beta <- c(beta, tmp$coefficients[5,1])
+  }
+  
+  rlt <- data.frame(
+    AptName = anaInfoSel$AptName,
+    UniProt = anaInfoSel$UniProt,
+    EntrezGeneID = anaInfoSel$EntrezGeneID,
+    EntrezGeneSymbol = anaInfoSel$EntrezGeneSymbol,
+    pvalue = pvalue,
+    beta = beta,
+    fdr = p.adjust(pvalue, method = "fdr"),
+    stringsAsFactors = FALSE
+  )
+  
+  write.csv(rlt, file = "tables/pvProteinAdj.csv", quote = TRUE, row.names = FALSE)
+  saveRDS(rlt, file = "data/pvProteinAdj.rds")
+  
+  dplot <- data.frame(
+    UniProt = rlt$UniProt,
+    Symbol = rlt$EntrezGeneSymbol,
+    beta = rlt$beta,
+    pvalue = -log10(rlt$pvalue),
+    stringsAsFactors = FALSE
+  )
+  
+  pvCutoff <- -log10(0.05)
+  betaCutoff <- log2(1.5)
+  
+  dplot$group <- "G0"
+  dplot$group[dplot$pvalue> pvCutoff & dplot$beta < -betaCutoff] <- "G1"
+  dplot$group[dplot$pvalue> pvCutoff & dplot$beta > betaCutoff] <- "G2"
+  
+  dplotText <- dplot[dplot$group!="G0",]
+  
+  gp <- ggplot(dplot) +
+    geom_point(aes(x=beta, y = pvalue, color = group), size = 1) + 
+    geom_text_repel(data = dplotText, aes(x=beta, y=pvalue, label = Symbol, color = group), size = 3)+
+    geom_vline(xintercept = c(-betaCutoff,betaCutoff), color = "grey", linetype = 2) + 
+    geom_hline(yintercept = c(pvCutoff), color = "grey", linetype = 2) + 
+    scale_color_manual(values = c(G0="grey", G1="#0072B5FF", G2="#BC3C29FF")) + 
+    labs(x = "log2 Ratio", y="-log10 (p value)") + 
+    theme_classic() + 
+    theme(legend.position = "none")
+  
+  png("figures/volcanoAdj.png", width = 5, height = 4, units = "in", res = 300)
+  print(gp)
+  invisible(dev.off())
+} else {
+  rlt <- readRDS("data/pvProteinAdj.rds")
+}
+
+```
+
+
+There are 8 proteins with p value less than 0.05 and fold change larger than 15 or smaller than 0.667 as shown in the volcano plot below. 
+
+
+![Volcano plot](figures/volcanoAdj.png){width=50%}
+
+
+Top 10 proteins with smallest p values are listed in the table below. Many of them overlapped with the top 10 proteins wihtout adjustment. 
+
+```{r top10proteinAdj}
+idx <- order(rlt$pvalue)[1:10]
+
+if(firstRun){
+  gps <- list()
+  for(i in 1:length(idx)){
+    gp <- ggplot(data.frame(y=somaSel[, idx[i]], group = phenotype$Grp)) + 
+      geom_boxplot(aes(x=group, y=y)) + 
+      labs(x="", y=anaInfoSel$EntrezGeneSymbol[idx[i]]) + 
+      theme_classic()
+    gps[[i]] <- gp
+  }
+  
+  gp <- ggpubr::ggarrange(plotlist = gps, ncol=2, nrow = 5)
+  
+  png("figures/top10ProteinAdj.png", width = 10, height = 20, units = "in", res = 300)
+  print(gp)
+  invisible(dev.off())
+}
+
+
+kable(rlt[idx,], caption = "Top 10 proteins with smallest p value with adjustment", row.names = FALSE) %>%
+  kable_styling(full_width = F, position = "left", html_font = "Cambria")
+```
+
+
+![Box plot of top 10 proteins with adjustment](figures/top10ProteinAdj.png){width=50%}
+
+
+
+##### Male Only
+
+We used a regression model listed below to investigate the difference between RLS patients and controls after adjusting age, and BMI. 
+
+$log(Protein) = \beta_0 + \beta_1*age + \beta_2 * BMI + \beta_3*RLS$
+
+
+
+```{r proteinLevelAnalysisAdjMale}
+if(firstRun){
+  age <- phenotype$Age[phenotype$Sex=="M"]
+  bmi <- phenotype$BMI[phenotype$Sex=="M"]
+  rls <- ifelse(phenotype$Grp[phenotype$Sex=="M"] == "Control", 0, 1)
+  
+  pvalue <- NULL
+  beta <- NULL
+  for(i in 1:ncol(somaSel)){
+    y <- log2(somaSel[phenotype$Sex=="M",i])
+    
+    tmp <- lm(y ~ age + bmi + rls)
+    tmp <- summary(tmp)
+    
+    pvalue <- c(pvalue, tmp$coefficients[4,4])
+    beta <- c(beta, tmp$coefficients[4,1])
+  }
+  
+  rlt <- data.frame(
+    AptName = anaInfoSel$AptName,
+    UniProt = anaInfoSel$UniProt,
+    EntrezGeneID = anaInfoSel$EntrezGeneID,
+    EntrezGeneSymbol = anaInfoSel$EntrezGeneSymbol,
+    pvalue = pvalue,
+    beta = beta,
+    fdr = p.adjust(pvalue, method = "fdr"),
+    stringsAsFactors = FALSE
+  )
+  
+  write.csv(rlt, file = "tables/pvProteinAdjMale.csv", quote = TRUE, row.names = FALSE)
+  saveRDS(rlt, file = "data/pvProteinAdjMale.rds")
+  
+  dplot <- data.frame(
+    UniProt = rlt$UniProt,
+    Symbol = rlt$EntrezGeneSymbol,
+    beta = rlt$beta,
+    pvalue = -log10(rlt$pvalue),
+    stringsAsFactors = FALSE
+  )
+  
+  pvCutoff <- -log10(0.05)
+  betaCutoff <- log2(1.5)
+  
+  dplot$group <- "G0"
+  dplot$group[dplot$pvalue> pvCutoff & dplot$beta < -betaCutoff] <- "G1"
+  dplot$group[dplot$pvalue> pvCutoff & dplot$beta > betaCutoff] <- "G2"
+  
+  dplotText <- dplot[dplot$group!="G0",]
+  
+  gp <- ggplot(dplot) +
+    geom_point(aes(x=beta, y = pvalue, color = group), size = 1) + 
+    geom_text_repel(data = dplotText, aes(x=beta, y=pvalue, label = Symbol, color = group), size = 2, max.overlaps = 20)+
+    geom_vline(xintercept = c(-betaCutoff,betaCutoff), color = "grey", linetype = 2) + 
+    geom_hline(yintercept = c(pvCutoff), color = "grey", linetype = 2) + 
+    scale_color_manual(values = c(G0="grey", G1="#0072B5FF", G2="#BC3C29FF")) + 
+    labs(x = "log2 Ratio", y="-log10 (p value)") + 
+    theme_classic() + 
+    theme(legend.position = "none")
+  
+  png("figures/volcanoAdjMale.png", width = 5, height = 4, units = "in", res = 300)
+  print(gp)
+  invisible(dev.off())
+} else {
+  rlt <- readRDS("data/pvProteinAdjMale.rds")
+}
+
+```
+
+
+There are 68 proteins with p value less than 0.05 and fold change larger than 15 or smaller than 0.667 as shown in the volcano plot below. 
+
+
+![Volcano plot](figures/volcanoAdjMale.png){width=50%}
+
+Top 10 proteins with smallest p values are listed in the table below. 
+
+```{r top10proteinAdj}
+idx <- order(rlt$pvalue)[1:10]
+
+if(firstRun){
+  gps <- list()
+  for(i in 1:length(idx)){
+    gp <- ggplot(data.frame(y=somaSel[, idx[i]], group = phenotype$Grp)) + 
+      geom_boxplot(aes(x=group, y=y)) + 
+      labs(x="", y=anaInfoSel$EntrezGeneSymbol[idx[i]]) + 
+      theme_classic()
+    gps[[i]] <- gp
+  }
+  
+  gp <- ggpubr::ggarrange(plotlist = gps, ncol=2, nrow = 5)
+  
+  png("figures/top10ProteinAdjMale.png", width = 10, height = 20, units = "in", res = 300)
+  print(gp)
+  invisible(dev.off())
+}
+
+
+kable(rlt[idx,], caption = "Top 10 proteins with smallest p value with adjustment", row.names = FALSE) %>%
+  kable_styling(full_width = F, position = "left", html_font = "Cambria")
+```
+
+
+![Box plot of top 10 proteins with adjustment](figures/top10ProteinAdjMale.png){width=50%}
+
+
+##### Female Only
+
+We used a regression model listed below to investigate the difference between RLS patients and controls after adjusting age, and BMI. 
+
+$log(Protein) = \beta_0 + \beta_1*age + \beta_2 * BMI + \beta_3*RLS$
+
+
+
+```{r proteinLevelAnalysisAdjFemale}
+if(firstRun){
+  age <- phenotype$Age[phenotype$Sex=="F"]
+  bmi <- phenotype$BMI[phenotype$Sex=="F"]
+  rls <- ifelse(phenotype$Grp[phenotype$Sex=="F"] == "Control", 0, 1)
+  
+  pvalue <- NULL
+  beta <- NULL
+  for(i in 1:ncol(somaSel)){
+    y <- log2(somaSel[phenotype$Sex=="F",i])
+    
+    tmp <- lm(y ~ age + bmi + rls)
+    tmp <- summary(tmp)
+    
+    pvalue <- c(pvalue, tmp$coefficients[4,4])
+    beta <- c(beta, tmp$coefficients[4,1])
+  }
+  
+  rlt <- data.frame(
+    AptName = anaInfoSel$AptName,
+    UniProt = anaInfoSel$UniProt,
+    EntrezGeneID = anaInfoSel$EntrezGeneID,
+    EntrezGeneSymbol = anaInfoSel$EntrezGeneSymbol,
+    pvalue = pvalue,
+    beta = beta,
+    fdr = p.adjust(pvalue, method = "fdr"),
+    stringsAsFactors = FALSE
+  )
+  
+  write.csv(rlt, file = "tables/pvProteinAdjFemale.csv", quote = TRUE, row.names = FALSE)
+  saveRDS(rlt, file = "data/pvProteinAdjFemale.rds")
+  
+  dplot <- data.frame(
+    UniProt = rlt$UniProt,
+    Symbol = rlt$EntrezGeneSymbol,
+    beta = rlt$beta,
+    pvalue = -log10(rlt$pvalue),
+    stringsAsFactors = FALSE
+  )
+  
+  pvCutoff <- -log10(0.05)
+  betaCutoff <- log2(1.5)
+  
+  dplot$group <- "G0"
+  dplot$group[dplot$pvalue> pvCutoff & dplot$beta < -betaCutoff] <- "G1"
+  dplot$group[dplot$pvalue> pvCutoff & dplot$beta > betaCutoff] <- "G2"
+  
+  dplotText <- dplot[dplot$group!="G0",]
+  
+  gp <- ggplot(dplot) +
+    geom_point(aes(x=beta, y = pvalue, color = group), size = 1) + 
+    geom_text_repel(data = dplotText, aes(x=beta, y=pvalue, label = Symbol, color = group), size = 2, max.overlaps = 20)+
+    geom_vline(xintercept = c(-betaCutoff,betaCutoff), color = "grey", linetype = 2) + 
+    geom_hline(yintercept = c(pvCutoff), color = "grey", linetype = 2) + 
+    scale_color_manual(values = c(G0="grey", G1="#0072B5FF", G2="#BC3C29FF")) + 
+    labs(x = "log2 Ratio", y="-log10 (p value)") + 
+    theme_classic() + 
+    theme(legend.position = "none")
+  
+  png("figures/volcanoAdjFemale.png", width = 5, height = 4, units = "in", res = 300)
+  print(gp)
+  invisible(dev.off())
+} else {
+  rlt <- readRDS("data/pvProteinAdjFemale.rds")
+}
+
+```
+
+
+There are 17 proteins with p value less than 0.05 and fold change larger than 15 or smaller than 0.667 as shown in the volcano plot below. 
+
+
+![Volcano plot](figures/volcanoAdjFemale.png){width=50%}
+
+Top 10 proteins with smallest p values are listed in the table below. 
+
+```{r top10proteinAdj}
+idx <- order(rlt$pvalue)[1:10]
+
+if(firstRun){
+  gps <- list()
+  for(i in 1:length(idx)){
+    gp <- ggplot(data.frame(y=somaSel[, idx[i]], group = phenotype$Grp)) + 
+      geom_boxplot(aes(x=group, y=y)) + 
+      labs(x="", y=anaInfoSel$EntrezGeneSymbol[idx[i]]) + 
+      theme_classic()
+    gps[[i]] <- gp
+  }
+  
+  gp <- ggpubr::ggarrange(plotlist = gps, ncol=2, nrow = 5)
+  
+  png("figures/top10ProteinAdjFemale.png", width = 10, height = 20, units = "in", res = 300)
+  print(gp)
+  invisible(dev.off())
+}
+
+
+kable(rlt[idx,], caption = "Top 10 proteins with smallest p value with adjustment", row.names = FALSE) %>%
+  kable_styling(full_width = F, position = "left", html_font = "Cambria")
+```
+
+
+![Box plot of top 10 proteins with adjustment](figures/top10ProteinAdjFemale.png){width=50%}
+
+
+##### Compare
+Two shared proteins ("CEMIP2" and "CSMD1") between male and female have different directions. 
+```{r geneLevelCompareAdj}
+if(firstRun){
+  rlt <- readRDS("data/pvProteinAdj.rds")
+  rltMale <- readRDS("data/pvProteinAdjMale.rds")
+  rltFemale <- readRDS("data/pvProteinAdjFemale.rds")
+  
+  x <- list(
+    All = rlt$EntrezGeneSymbol[rlt$pvalue<0.05 & abs(rlt$beta) > log2(1.5)],
+    Male = rltMale$EntrezGeneSymbol[rltMale$pvalue<0.05 & abs(rltMale$beta) > log2(1.5)],
+    Female = rltFemale$EntrezGeneSymbol[rltFemale$pvalue<0.05 & abs(rltFemale$beta) > log2(1.5)]
+  )
+  
+  png("figures/vennGeneAdj.png", width = 5, height = 4, units = 'in', res = 300)
+  ggvenn::ggvenn(
+    x, 
+    fill_color = c("#0073C2FF", "#EFC000FF", "#868686FF"),
+    stroke_size = 0.5, set_name_size = 4
+  )
+  invisible(dev.off())
+  
+}
+
+```
+
+![Shared significant proteins](figures/vennGeneAdj.png){width=50%}
+
+
+
+#### Gene set enrichment analysis
+
+##### All
+Similar GSEA was applied to results with adjustment. 
+
+```{r pathwayAdj}
+if(firstRun){
+  rlt <- readRDS("data/pvProteinAdj.rds")
+  geneList <- rlt$beta
+  names(geneList) <- rlt$UniProt
+  geneList <- sort(geneList, decreasing = TRUE)
+  
+  gKEGG <- clusterProfiler::gseKEGG(
+    geneList     = geneList,
+    organism     = 'hsa', 
+    keyType = "uniprot",
+    minGSSize    = 10,
+    pvalueCutoff = 0.05,
+    verbose      = FALSE)
+  
+  
+  gGO <- clusterProfiler::gseGO(
+    geneList     = geneList,
+    ont = "ALL",
+    OrgDb = org.Hs.eg.db,
+    keyType = "UNIPROT",
+    minGSSize    = 100,
+    maxGSSize = 500,
+    eps = 0,
+    pvalueCutoff = 0.05,
+    verbose      = FALSE)
+  
+  save(gKEGG, gGO, file = "rlt/GSEAAdj.RData")
+  
+  
+  png("figures/dotPlotKEGGAdj.png", width = 7, height = 7, units = "in", res = 300)
+  #enrichplot::dotplot(gKEGG, x="Count", showCategory = gKEGG@result$Description[idx[1:10]])
+  enrichplot::dotplot(gKEGG)
+  invisible(dev.off())
+  
+  png("figures/upsetKEGGAdj.png", width = 10, height = 7, units = "in", res = 300)
+  enrichplot::upsetplot(gKEGG)
+  invisible(dev.off())
+  
+  
+  png("figures/dotPlotGOAdj.png", width = 7, height = 7, units = "in", res = 300)
+  #enrichplot::dotplot(gKEGG, x="Count", showCategory = gKEGG@result$Description[idx[1:10]])
+  enrichplot::dotplot(gGO)
+  invisible(dev.off())
+  
+  png("figures/upsetGOAdj.png", width = 10, height = 7, units = "in", res = 300)
+  enrichplot::upsetplot(gGO)
+  invisible(dev.off())
+}
+
+```
+
+
+###### KEGG
+![Dotplot of top 10 KEGG pathways](figures/dotPlotKEGGAdj.png){width=50%}
+
+![Upset plot of top 10 KEGG pathways](figures/upsetKEGGAdj.png){width=50%}
+
+###### Gene Ontology
+
+![Dotplot of top 10 GO gene sets](figures/dotPlotGOAdj.png){width=50%}
+
+
+![Upset plot of top 10 GO gene sets](figures/upsetGOAdj.png){width=50%}
+
+
+##### Male only
+Similar GSEA was applied to results with adjustment. 
+
+```{r pathwayAdjMale}
+if(firstRun){
+  rlt <- readRDS("data/pvProteinAdjMale.rds")
+  geneList <- rlt$beta
+  names(geneList) <- rlt$UniProt
+  geneList <- sort(geneList, decreasing = TRUE)
+  
+  gKEGG <- clusterProfiler::gseKEGG(
+    geneList     = geneList,
+    organism     = 'hsa', 
+    keyType = "uniprot",
+    minGSSize    = 10,
+    pvalueCutoff = 0.05,
+    verbose      = FALSE)
+  
+  
+  gGO <- clusterProfiler::gseGO(
+    geneList     = geneList,
+    ont = "ALL",
+    OrgDb = org.Hs.eg.db,
+    keyType = "UNIPROT",
+    minGSSize    = 100,
+    maxGSSize = 500,
+    eps = 0,
+    pvalueCutoff = 0.05,
+    verbose      = FALSE)
+  
+  save(gKEGG, gGO, file = "rlt/GSEAAdjMale.RData")
+  
+  
+  png("figures/dotPlotGOAdjMale.png", width = 7, height = 7, units = "in", res = 300)
+  #enrichplot::dotplot(gKEGG, x="Count", showCategory = gKEGG@result$Description[idx[1:10]])
+  enrichplot::dotplot(gGO)
+  invisible(dev.off())
+  
+  png("figures/upsetGOAdjMale.png", width = 10, height = 7, units = "in", res = 300)
+  enrichplot::upsetplot(gGO)
+  invisible(dev.off())
+}
+
+```
+
+
+###### KEGG
+No significant pathways.
+
+###### Gene Ontology
+
+![Dotplot of top 10 GO gene sets](figures/dotPlotGOAdjMale.png){width=50%}
+
+
+![Upset plot of top 10 GO gene sets](figures/upsetGOAdjMale.png){width=50%}
+
+
+
+##### Female only
+Similar GSEA was applied to results with adjustment. 
+
+```{r pathwayAdjMale}
+if(firstRun){
+  rlt <- readRDS("data/pvProteinAdjFemale.rds")
+  geneList <- rlt$beta
+  names(geneList) <- rlt$UniProt
+  geneList <- sort(geneList, decreasing = TRUE)
+  
+  gKEGG <- clusterProfiler::gseKEGG(
+    geneList     = geneList,
+    organism     = 'hsa', 
+    keyType = "uniprot",
+    minGSSize    = 10,
+    pvalueCutoff = 0.05,
+    verbose      = FALSE)
+  
+  
+  gGO <- clusterProfiler::gseGO(
+    geneList     = geneList,
+    ont = "ALL",
+    OrgDb = org.Hs.eg.db,
+    keyType = "UNIPROT",
+    minGSSize    = 100,
+    maxGSSize = 500,
+    eps = 0,
+    pvalueCutoff = 0.05,
+    verbose      = FALSE)
+  
+  save(gKEGG, gGO, file = "rlt/GSEAAdjFemale.RData")
+  
+  png("figures/dotPlotKEGGAdjFemale.png", width = 7, height = 7, units = "in", res = 300)
+  #enrichplot::dotplot(gKEGG, x="Count", showCategory = gKEGG@result$Description[idx[1:10]])
+  enrichplot::dotplot(gKEGG)
+  invisible(dev.off())
+  
+  png("figures/upsetKEGGAdjFemale.png", width = 10, height = 7, units = "in", res = 300)
+  enrichplot::upsetplot(gKEGG)
+  invisible(dev.off())
+  
+  
+  
+  png("figures/dotPlotGOAdjFemale.png", width = 7, height = 7, units = "in", res = 300)
+  #enrichplot::dotplot(gKEGG, x="Count", showCategory = gKEGG@result$Description[idx[1:10]])
+  enrichplot::dotplot(gGO)
+  invisible(dev.off())
+  
+  png("figures/upsetGOAdjFemale.png", width = 10, height = 7, units = "in", res = 300)
+  enrichplot::upsetplot(gGO)
+  invisible(dev.off())
+}
+
+```
+
+
+###### KEGG
+![Dotplot of top 10 KEGG pathways](figures/dotPlotKEGGAdjFemale.png){width=50%}
+
+![Upset plot of top 10 KEGG pathways](figures/upsetKEGGAdjFemale.png){width=50%}
+
+###### Gene Ontology
+
+![Dotplot of top 10 GO gene sets](figures/dotPlotGOAdjFemale.png){width=50%}
+
+
+![Upset plot of top 10 GO gene sets](figures/upsetGOAdjFemale.png){width=50%}
+
+
+
+
+
+### Comparing to other researches
+
+#### Significant proteins
+We compared our results to genes/proteins associated with RLS in other studies. I found three studies. One is a GWAS of RLS ("Large genome-wide association study identifies three novel risk variants for restless legs syndrome" PMCID: PMC7689502). They found several associated SNPs which belongs to a few genes ("SLC40A1", "RANBP17", "MICALL2", "UNCX", "LMO1", "PMAIP1", "MEIS1", "PTPRD", "MYT1", "BTBD9", "PTPRD", "CCDC148", "MAP2K5"). Many of these genes are not included in our study. The table below lists the results of our study for these genes. 
+
+
+```{r rltCompare1}
+pvProteinAdj <- readRDS("data/pvProteinAdj.rds")
+
+# "Large genome-wide association study identifies three novel risk variants for restless legs syndrome" PMCID: PMC7689502. 
+gwasGenes <- c("SLC40A1", "RANBP17", "MICALL2", "UNCX", "LMO1", "PMAIP1", "MEIS1", 
+               "PTPRD", "MYT1", "BTBD9", "PTPRD", "CCDC148", "MAP2K5")
+
+
+kable(pvProteinAdj[(pvProteinAdj$EntrezGeneSymbol %in% gwasGenes),-7], caption = "Our results of proteins found in GWAS", row.names = FALSE) %>%
+  kable_styling(full_width = F, position = "left", html_font = "Cambria")
+
+```
+
+
+Another protein study ("Proteomic analysis of the cerebrospinal fluid of patients with restless legs syndrome/Willis-Ekbom disease" PMCID: PMC3680184)
+
+```{r rltCompare2}
+pvProteinAdj <- readRDS("data/pvProteinAdj.rds")
+
+# "Proteomic analysis of the cerebrospinal fluid of patients with restless legs syndrome/Willis-Ekbom disease" PMCID: PMC3680184
+
+
+
+kable(pvProteinAdj[(pvProteinAdj$EntrezGeneSymbol %in% c("ORM", "APOA1", "CST3", "PTGDS", "GC", "HBB")), -7], caption = "Our results of proteins found in the second study", row.names = FALSE) %>%
+  kable_styling(full_width = F, position = "left", html_font = "Cambria")
+
+```
+
+Third study ("Discovery of restless legs syndrome plasmatic biomarkers by proteomic analysis", PMCID: PMC6192389). There might be more than one SOMAmer reagents targeted one protein. That is why there are multiple rows of C3 and KNG1 in the table. 
+
+```{r rltCompare3}
+pvProteinAdj <- readRDS("data/pvProteinAdj.rds")
+
+# "Discovery of restless legs syndrome plasmatic biomarkers by proteomic analysis", PMCID: PMC6192389
+
+kable(pvProteinAdj[(pvProteinAdj$EntrezGeneSymbol %in% c("C3", "SERPINA1", "A1BG", "ORM1", "HP", "C4A", "IGKC", "KNG1", "IGHA1", "IGLC2")), -7], caption = "Our results of proteins found in the third study", row.names = FALSE) %>%
+  kable_styling(full_width = F, position = "left", html_font = "Cambria")
+
+```
+
+
+
+## Data mining
+
+I tried a few data mining methods to predict RLS status from protein profile. However, none of these methods has a relatively good performance. I will try some other methods later. 
+
+```{r datamining}
+if(firstRun){
+  sex <- ifelse(phenotype$Sex=="F", 0, 1)
+  age <- phenotype$Age
+  bmi <- phenotype$BMI
+  
+  x <- scale(log2(as.matrix(somaSel)))
+  x <- cbind(sex, age, bmi, x)
+  
+
+  
+  set.seed(123)
+  prob <- NULL
+  votes <- NULL
+  for(i in 1:nrow(somaSel)){
+    pv <- NULL
+    for(j in 4:ncol(x)){
+      tmp <- t.test(x[-i, j] ~ phenotype$Grp[-i])
+      pv <- c(pv, tmp$p.value)
+    }
+    idx50 <- order(pv)[1:50]
+    
+    cvLasso <- cv.glmnet(x[-i,c(1:3, idx50+3)], phenotype$Grp[-i], alpha = 1, family = "binomial", nfolds = 5, grouped = FALSE)
+    lassoModel <- glmnet(x[-i,c(1:3, idx50+3)], phenotype$Grp[-i], alpha = 1, family = "binomial", lambda = cvLasso$lambda.min)
+    
+    prob <- c(prob, predict(lassoModel, newx = x[i,c(1:3, idx50+3)], type = "response"))
+    
+    rfModel <- randomForest(x=x[-i,c(1:3, idx50+3)], y=as.factor(phenotype$Grp[-i]), ntree = 1000, importance = TRUE)
+    
+    votes <- c(votes, predict(rfModel, x[i,c(1:3, idx50+3)], type = "vote")[1])
+  }
+  plot(pROC::roc(phenotype$Grp, prob), print.auc = TRUE)
+  
+  png("figures/AUCLR.png", width =4, height = 4, units = "in", res = 300)
+  plot(pROC::roc(phenotype$Grp, prob), print.auc = TRUE)
+  invisible(dev.off())
+  
+  
+  cvLasso <- cv.glmnet(x, phenotype$Grp, alpha = 1, family = "binomial", nfolds = 5, grouped = FALSE)
+  lassoModel <- glmnet(x, phenotype$Grp, alpha = 1, family = "binomial", lambda = cvLasso$lambda.min)
+  
+  rfModel <- randomForest(x=x, y=as.factor(phenotype$Grp), ntree = 1000, importance = TRUE)
+  
+  
+  
+  
+  png("figures/AUCRFOutBag.png", width =4, height = 4, units = "in", res = 300)
+  plot(pROC::roc(phenotype$Grp, rfModel$votes[,1]), print.auc = TRUE)
+  invisible(dev.off())
+}
+
+```
+
+
+
+## Summary
+This might be the first study investigating over 7000 proteins in RLS. We may found some new significant proteins that have not been found before. However, there are only 40 samples in this study. Many of the significant proteins might be false positives. GSEA should be more reliable. In a previous study, "Searching for Novel Candidate Biomarkers of RLS in Blood by Proteomic Analysis" PMCID: PMC8243594, RLS is associated with inflammatory and immune response. Most significant KEGG pathways we found are associated with inflammatory and immune response. 
+
+
+
